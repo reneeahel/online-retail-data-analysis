@@ -1,0 +1,1065 @@
+---
+title: "Online retail data analysis using R, tidyverse, sparklyr and Spark"
+author: "Author: Renee Ahel"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    
+---
+
+The purpose of the analysis is to extract insights with business value for an online retailer using [R](https://www.r-project.org/), [tidyverse](https://www.tidyverse.org/), [sparklyr](https://spark.rstudio.com/), and [Spark](https://spark.apache.org/).
+A large part of the analysis consists of data cleaning and basic exploratory analysis, as usually is the case with data science projects. After those basic steps, I employ machine learning algorithms on Spark to uncover more complex customer behavior patterns, like which products are frequently purchased together.
+
+If you prefer to skip the gory details and wish to look at some of the end results, take a look at the [demo web app](https://renee-ahel.shinyapps.io/OnlineRetailDemo/).
+
+Data analyzed is a table containing real [online retail sales data](https://archive.ics.uci.edu/ml/datasets/Online%20Retail) downloaded from the  [UCI machine learning repository](https://archive.ics.uci.edu/ml/index.php). It contains all the transactions occurring between 01/12/2010 and 09/12/2011 for a UK-based and registered non-store online retail. The company mainly sells unique all-occasion gifts. Many customers of the company are wholesalers. 
+
+The description implies that the sales transactions are a mix of wholesale and retail transactions - it would be important to make that distinction, as the purchasing behavior of wholesale and retail customers differs significantly.
+
+### Dataset column descriptions - from the dataset download page:
+
+Column      | Description
+------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------
+InvoiceNo   | Invoice number. Nominal, a 6-digit integral number uniquely assigned to each transaction. If this code starts with letter 'c', it indicates a cancellation.
+StockCode   | Product (item) code. Nominal, a 5-digit integral number uniquely assigned to each distinct product.
+Description | Product (item) name. Nominal.
+Quantity    | The quantities of each product (item) per transaction. Numeric.
+InvoiceDate | Invice Date and time. Numeric, the day and time when each transaction was generated.
+UnitPrice   | Unit price. Numeric, Product price per unit in sterling.
+CustomerID  | Customer number. Nominal, a 5-digit integral number uniquely assigned to each customer.
+Country     | Country name. Nominal, the name of the country where each customer resides. 
+
+Dataset has been downloaded, it's a 22.6 MB Excel file containing 541.909 records. It is located in the Data subdirectory: "Data/Online Retail.xlsx"
+
+### Environment setup
+
+Let's start with basic initialization - I'll be using tidyverse for data manipulation and visualization, and Spark for data processing. R sparklyr package will enable me to do data analysis using the typical tidyverse approach, while leveraging the power of Spark in the background. As I don't have a real Spark cluster at my disposal, I'll be using a local Spark instance, which comes with the sparklyr package. Compared to using a cluster syntax - wise, only the connection string is different.
+```{r initialization, message=FALSE}
+library(tidyverse)
+library(sparklyr)
+library(readxl)
+
+# Connect to local Spark instance
+sc <- spark_connect(master = "local",spark_home = "~/spark/spark-2.3.1-bin-hadoop2.7", app_name = "retail_data_analysis")
+```
+
+
+In a real production environment, transactions data would already be available on the cluster, in Hadoop or Hive accessible via Spark. In this case, I'll have to put the data into local Spark instance myself. Since Spark itself is not able to read Excel files, I'll use the tidyverse package readxl to read the data into a tibble (tidyverse dataframe), and then push it to Spark in-memory DataFrame. Additionally, I'll ensure that the Spark dataframe is persisted across sessions by writing it to a Parquet file(s) on a local filesystem.
+This step needs to be executed only once - for new analysis runs Spark can read directly from the Parquet file(s).
+```{r initial data import}
+# skip this step if it's been done in a previous analysis run
+if(!file.exists("Data/spark-warehouse/sales-transactions")){
+  # read the dataset into R
+  sales_transactions <- read_excel("Data/Online Retail.xlsx")
+  
+  # basic check to see the data has been properly read
+  head(sales_transactions)
+  dim(sales_transactions)
+  
+  # pushing the data into Spark DataFrame
+  sales_transactions_tbl <- copy_to(sc, sales_transactions, "sales_transactions", overwrite = TRUE)
+  # mark the cancelled invoices, correct the country name, create InvoicePrefix indicator
+  sales_transactions_tbl <- sales_transactions_tbl %>%
+    mutate(InvoiceStatus = ifelse(InvoiceNo %in% c("581483", "541431", "556444"), "Cancelled", NA),
+           Country = ifelse(Country == "EIRE", "Ireland", Country),
+           InvoicePrefix = ifelse(substr(InvoiceNo,1,1) %in% letters | substr(InvoiceNo,1,1) %in% LETTERS, substr(InvoiceNo,1,1), NA))
+  # check if the table is available on Spark
+  src_tbls(sc)
+  # save the Spark DataFrame to a Parquet file(s) for persistence across sessions (Spark applications) - to a local filesystem, current project Data/spark-warehouse  subdirectory
+  spark_write_parquet(sales_transactions_tbl, str_c("file:", getwd(), "/Data/spark-warehouse/sales-transactions"),mode = "overwrite")
+}
+```
+
+
+We can now start the analysis by reading the data into Spark DataFrame from the Parquet file(s):
+```{r data import}
+# read from Parquet into in-memory Spark DataFrame
+sales_transactions_tbl <- spark_read_parquet(sc, "sales_transactions", str_c("file:", getwd(), "/Data/spark-warehouse/sales-transactions"), mode = "overwrite")
+```
+
+
+Since data sits on Spark, let's pull a small sample of 10 rows to see the table structure:
+```{r sample data structure}
+sales_transactions_tbl %>%
+   sample_n(10)
+```
+From this quick look it seems all the columns from the description are there, and their datatypes are in line with the descriptions.
+It is also clear that the records are actually transaction details - every record corresponds to one line item from the invoice. To get a general overview of the online retailer sales, it would make sense to aggregate the data to invoice level first.
+
+
+### Data Quality
+
+Let's first look at general data quality - how many records, how many distinct invoices, distinct customers, missing values?
+```{r quick data quality}
+ sales_transactions_tbl %>%
+   summarise(n_records = n(),
+             n_invoices = n_distinct(InvoiceNo),
+             n_missing_inv_rec = sum(as.integer(is.na(InvoiceNo)),na.rm = TRUE), 
+             n_customers = n_distinct(CustomerID),
+             n_missing_cust_rec = sum(as.integer(is.na(CustomerID)),na.rm = TRUE))
+```
+Good news - all of the records have an invoice identifier set. This will make aggregating data to invoice level easy. Only 25.900 invoices with 541.909 line items - an average of 20.92 line items per invoice. It looks like wholesaler orders are dominating this dataset. I'll have to check this assumption later, by looking at the distribution of invoices by the number of line items.
+Most interestingly, 1/4 of records have no CustomerID - retail customers or just unregistered retail customers? This would be a good time to get back to the client businesspeople with that question. In this case, I'll look at the distribution of invoices by the number of line items and by having/not having CustomerID. If invoices without CustomerIDs really belong to retail customers, their distribution of invoices by line items should be radically different than the one with CustomerIDs (the wholesalers).
+
+
+Before aggregating to invoice level, let's do more data quality checks - especially on columns that will be aggregated.
+```{r data quality}
+sales_transactions_tbl %>%
+  summarise(n_dist_stocks = n_distinct(StockCode), 
+            n_missing_stocks = sum(as.integer(is.na(StockCode)),na.rm = TRUE), 
+            n_dist_desc = n_distinct(Description), 
+            n_missing_desc = sum(as.integer(is.na(Description)),na.rm = TRUE), 
+            n_missing_quant = sum(as.integer(is.na(Quantity)),na.rm = TRUE),
+            n_missing_prices = sum(as.integer(is.na(UnitPrice)),na.rm = TRUE))
+```
+Good news - all of the line items have all of the necessary data filled: StockCode, Description, Quantity and UnitPrice. Number of distinct stock descriptions is a bit larger than the number of distinct stock codes, implying that some stock codes have multiple descriptions - probably due to name corrections during the year. This is sometihng to check later, when the focus will be on stock items.
+
+
+### Invoice level analysis
+
+Now I'm ready to aggregate the data to invoice level. I'll also save the invoice level data to Parquet file(s) for persistence.
+This step should be executed only once - for new analysis runs Spark can read directly from the Parquet file(s).
+I'll also add an indicator column for cancellations (from the InvoiceNo column description).
+I've found later that there are cases where not all line items in one invoice have the same InvoiceDate (they differ in a minute or two) - I'm working around that by taking the last timestamp for each invoice.
+I've also later detected large cancelled invoices, so I'm making sure they are marked here.
+```{r aggregation to invoice}
+# skip this step if it's been done in a previous analysis run
+if(!file.exists("Data/spark-warehouse/invoices")){
+  # create a temp table on Spark which holds the aggregation result
+  invoices_tbl <- sales_transactions_tbl %>%
+    group_by(InvoiceNo, InvoiceStatus, CustomerID, Country) %>%
+    summarise(InvoiceDate = max(InvoiceDate, na.rm = TRUE),
+              LineItems = n_distinct(StockCode),
+              ItemQuantity = sum(Quantity, na.rm = TRUE),
+              InvoiceAmount = sum(Quantity * UnitPrice, na.rm = TRUE)) %>%
+    mutate(InvoicePrefix = ifelse(substr(InvoiceNo,1,1) %in% letters | substr(InvoiceNo,1,1) %in% LETTERS, substr(InvoiceNo,1,1), NA))
+  
+  # register the temp table in Spark
+  sdf_register(invoices_tbl, "invoices")
+  # save the Spark DataFrame to a Parquet file(s) for persistence across sessions (Spark applications) - to a local filesystem, current project Data/spark-warehouse  subdirectory
+  spark_write_parquet(invoices_tbl,str_c("file:", getwd(), "/Data/spark-warehouse/invoices"),mode = "overwrite")
+}
+```
+
+
+Let's load the invoices data into Spark memory.
+```{r invoices data import}
+# read from Parquet into in-memory Spark DataFrame
+invoices_tbl <- spark_read_parquet(sc, "invoices", str_c("file:", getwd(), "/Data/spark-warehouse/invoices"), mode = "overwrite")
+```
+
+One quick check - are invoice identifiers unique per row?
+```{r invoices duplicate check}
+invoices_tbl %>%
+  summarise(n_rows = n(),
+            n_distinct_invoices = n_distinct(InvoiceNo))
+```
+If there are some duplicates - let's look at them. I'll arrange them descending by the number of duplicate rows.
+```{r duplicate invoices details}
+invoices_tbl %>%
+  group_by(InvoiceNo) %>%
+  summarise(n_rows = n()) %>%
+  filter(n_rows > 1) %>%
+  inner_join(invoices_tbl, by = "InvoiceNo") %>%
+  arrange(desc(n_rows), InvoiceNo)
+```
+I've found the cause of the duplicates - not all invoice line items have the same datetime stamp. This can be easily fixed in the aggregation to invoice - I'll simply aggregate the InvoiceDate and take the latest timestamp.
+
+
+From the dataset description we know that there are some cancellations of invoices. How many, particularly in comparison with regular invoices?
+How do they compare in monetary value?
+```{r cancellations stats, fig.align = 'center'}
+# calculate summary stats in Spark and pull the result into R
+cancel_summary <- invoices_tbl %>%
+  group_by(InvoicePrefix) %>%
+  summarise(invoices = n(),
+            amounts = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  mutate(InvoiceType = ifelse(is.na(InvoicePrefix), "Regular", ifelse(InvoicePrefix == "C", "Cancellation", InvoicePrefix))) %>%
+  collect()
+
+# use ggplot2 for data display - number of invoices by invoice type
+ggplot(cancel_summary) +
+  geom_bar(aes(x = InvoiceType, y = invoices), stat = "identity", position = "dodge", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Invoice type", y = "Number of invoices")
+
+# invoice amounts by invoice type
+ggplot(cancel_summary) +
+  geom_bar(aes(x = InvoiceType, y = amounts), stat = "identity", position = "dodge", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Invoice type", y = "Invoice amounts (GBP)")
+```
+
+Number of cancellations is relatively high compared to regular invoices - it means every 6th invoice has been cancelled! A rather surprising insight - it may indicate something is wrong with the sales process or inventory management. On the invoice amounts side the situation is not so dramatic, but serious - cca 9% of total invoice amounts have been cancelled.
+
+
+How do cancellations relate to invoices? Is there a cancellation for every invoice? Is there a relationship?
+In order to realistically evaluate the sales performance, it would be ideal if I could remove cancellations and their corresponding invoices - as they do not relate to revenue.
+Let's look at top 10 cancellations by amount:
+```{r cancellation examples}
+invoices_tbl %>%
+  filter(InvoicePrefix == "C") %>%
+  arrange(desc(InvoiceAmount)) %>%
+  filter(rank(InvoiceAmount) <= 10)
+```
+All cancellations have a C prefix - is it possible that cancellation relates to invoice by number? Let's test that.
+
+Let's try joining the cancellations to invoices by number without the prefix.
+```{r join of cancellations to invoices}
+invoices_tbl %>%
+  filter(InvoicePrefix == "C") %>%
+  select(InvoiceNo, InvoiceDate, InvoiceAmount) %>%
+  transmute(CancelNo = InvoiceNo,
+            CancelDate = InvoiceDate,
+            CancelAmount = InvoiceAmount,
+            InvoiceNo = substr(InvoiceNo, 2, 7)) %>%
+  left_join(invoices_tbl, by = "InvoiceNo") %>%
+  select(CancelNo, CancelDate, CancelAmount, InvoiceNo, InvoiceDate, InvoiceAmount) %>%
+  arrange(CancelAmount) %>%
+  filter(!is.na(InvoiceAmount))
+```
+No matches. So there is no meaningful relationship between cancellations and regular invoices.
+
+Let's try to find a couple of invoices and their cancellations by the exact amount.
+```{r invoices cancellations by amount}
+invoices_tbl %>%
+  filter(abs(InvoiceAmount) %in% c(168469.60, 77183.60, 38970.00, 22998.40, 17836.46, 16888.02, 16453.71)) %>%
+  arrange(desc(abs(InvoiceAmount)))
+```
+A-ha! So there is a kind of relationship - at least for 3 largest invoices. Still, those invoices make up cca 30% of total cancellation value. I'll mark those as cancelled at the start of the analysis, and exclude them from all sales analyses.
+
+Now that we have marked cancelled invoices, let's continue the analysis only on regular, non-cancelled invoices.
+```{r keeping only regular invoices}
+invoices_tbl <- invoices_tbl %>%
+  filter(is.na(InvoicePrefix) & is.na(InvoiceStatus))
+```
+
+
+Let's now return to an earlier question - do invoices without CustomerID mean retail customers? Let's compare the distributions of number of line items for those two groups.
+If no-CustomerID group tends to have fewer line items than with-CustomerID group, it could be retail customers.
+```{r retail vs wholesale, fig.align = 'center'}
+invoices_tbl %>%
+  mutate(SuspCustGroup = ifelse(is.na(CustomerID), "Suspected retail", "Suspected wholesale")) %>%
+  group_by(LineItems, SuspCustGroup) %>%
+  summarise(num_invoices = n(), invoice_amounts = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  collect() %>%
+  ggplot() +
+  geom_bar(aes(x = LineItems, y = num_invoices), stat = "identity", fill = "#08306b") +
+    coord_cartesian(xlim = c(0, 100), ylim = c(0, 2500)) +
+    labs(x = "Line items on invoice", 
+         y = "Number of invoices",
+         fill = "Customer group") +
+    scale_fill_brewer(palette = "Set1") +
+  facet_grid(SuspCustGroup ~ .)
+```
+
+YES - the data confirms my assumption! In the suspected retail group there are a LOT more invoices with low number of items, while the suspected wholesalers group makes orders with a larger number of items. I'll introduce Retail and Wholesale groups to the rest of the data analysis. In a real-world project, this assumption would be double-checked with client businesspeople.
+
+```{r adding customer groups}
+invoices_tbl <- invoices_tbl %>%
+  mutate(CustomerGroup = ifelse(is.na(CustomerID), "Retail", "Wholesale"))
+```
+
+Let's now look at total number of invoices and revenue split by customer group:
+```{r invoices and revenue by customer group, fig.align = 'center'}
+cust_group_stats <- invoices_tbl %>%
+  group_by(CustomerGroup) %>%
+  summarise(n_invoices = n(),
+            invoice_amount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  collect()
+
+ggplot(cust_group_stats) +
+  geom_bar(aes(x = CustomerGroup, y = n_invoices), stat = "identity", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Customer group", 
+       y = "N of invoices",
+       title = "Number of invoices per customer group") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(cust_group_stats) +
+  geom_bar(aes(x = CustomerGroup, y = invoice_amount), stat = "identity", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Customer group", 
+       y = "Invoice amounts (GBP)",
+       title = "Invoice amounts per customer group") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+A new insight - retail part of the business is quite small, roughly 1/6 of the total business (invoices issued AND revenue). This means that business optimization should be focused on the wholesale side of the business to maximize impact on revenue. In a real-life project, this decision would be discussed with the businesspeople.
+
+Let's look at total sales in a year, per month and customer group:
+```{r sales amount by month and customer segment, fig.align = 'center'}
+# removing month 201112 because the data is not complete for that month (only up to 9/12/2011)
+invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  group_by(CustomerGroup, SalesMonth) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112) %>%
+  collect %>%
+  ggplot() +
+    geom_line(aes(x = SalesMonth, y = SalesAmount, group = CustomerGroup, color = CustomerGroup)) +
+    labs(x = "Sales month",
+         y = "Sales amount (GBP)",
+         title = "Total sales by month",
+         color = "Customer group") +
+    theme(axis.text.x = element_text(angle = 45),plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    scale_color_brewer(palette = "Paired")
+```
+
+For wholesalers, peak months are those leading to season changes - March (start of spring), May (summer is coming), September (autumn is coming) and of course Christmas and New Year. This is not surprising, as the company sells all-occasion gifts - they change with the seasons of the year. Sales uptick comes prior to season change, as wholesale customers are stocking with the coming season merchandise.
+There is also significant sales growth visible towards the end of the year, not caused by seasonality only - sales in November 2011 is twice the amount from December 2010. It will be interesting to see whether there are some particular items or customers driving that growth.
+
+For retail customers, seasonality is visible mainly in November and December (shopping season leading up to Christmas).
+
+
+Let's look at contribution of countries - maybe clients from new countries are driving the wholesale growth?
+```{r sales by country, fig.align = 'center'}
+top_5_sales_countries <- invoices_tbl %>%
+  group_by(Country) %>%
+  summarise(Amount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(rank(desc(Amount)) <= 5) %>%
+  collect
+
+invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate))),
+         Country = ifelse(Country %in% top_5_sales_countries$Country, Country, "Other")) %>%
+  group_by(CustomerGroup, SalesMonth, Country) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112) %>%
+  collect %>%
+  ggplot() +
+    geom_bar(aes(x = SalesMonth, y = SalesAmount, fill = reorder(factor(Country), SalesAmount)), stat = "identity") +
+    labs(x = "Sales month",
+         y = "Sales amount (GBP)",
+         title = "Total sales by month",
+         fill = "Country") +
+    theme(axis.text.x = element_text(angle = 45), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    scale_fill_brewer(palette = "Blues") +
+    facet_grid(. ~ CustomerGroup)
+```
+
+The charts reveal a couple of insights:
+UK sales heavily dominates in wholesale, roughly 85% of total sales comes from the UK - it's the store's home market. Other than UK, sales is mostly coming from neighboring countries. Rest of the world is almost negligible. Sales growth is fueled exclusively by UK market.
+In the retail business, sales is coming almost exclusively from the UK. This implies that any marketing actions should be focused on the domestic retail market.
+
+For exploratory purposes, I'll overlay the sales data by country on a world map. That will give a clearer impression on the reach of the shop.
+I'll create a choropleth map using the leaflet package.
+```{r sales by country worldmap, fig.align = 'center', message = FALSE, warning = FALSE, error=FALSE}
+library(leaflet)
+library(rworldmap)
+
+# aggregate revenue by country
+sales_by_country <- invoices_tbl %>%
+  group_by(Country) %>%
+  summarise(Amount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  collect
+
+  # join the revenue by country to the world map of countries
+  sPDF <- joinCountryData2Map(sales_by_country
+                                ,joinCode = "NAME"
+                                ,nameJoinColumn = "Country", verbose = FALSE)
+    
+    # select only the countries which generated revenue
+    existing_countries <- subset(sPDF, !is.na(Amount))
+    
+    # create spending classes for revenues per country
+    bins <- c(0, 50000, 100000, 150000, 200000, 250000, 300000, Inf)
+    # assign a color to each of the classes
+    pal <- colorBin("YlOrRd", domain = existing_countries$Amount, bins = bins)
+    
+    # create labels with actual revenue amounts per country, for hover info
+    labels <- paste0("<strong>", existing_countries$Country, "</strong><br/>", 
+                     format(existing_countries$Amount, digits = 0, big.mark = ".", decimal.mark = ",", scientific = FALSE),
+                     " GBP") %>% lapply(htmltools::HTML)
+    
+    # create the cloropleth map
+    leaflet(existing_countries) %>%
+      addTiles() %>%  # Add default OpenStreetMap map tiles
+      addPolygons(
+        fillColor = ~pal(Amount),
+        weight = 1,
+        opacity = 1,
+        color = "white",
+        dashArray = "3",
+        fillOpacity = 0.7,
+        highlight = highlightOptions(
+          weight = 2,
+          color = "#666",
+          dashArray = "",
+          fillOpacity = 0.7,
+          bringToFront = TRUE),
+        label = labels,
+        labelOptions = labelOptions(
+          style = list("font-weight" = "normal", padding = "3px 8px"),
+          textsize = "15px",
+          direction = "auto")) %>% 
+      addLegend(pal = pal, values = ~Amount, opacity = 0.7, title = NULL,
+                                            position = "topright") %>%
+      setView(17,34,2)
+```
+
+Besides the neighboring countries, there is one other country with a marginally significant revenue - Australia!
+
+
+I can now focus on the UK sales - that's where the action is. Let's see if the wholesale growth is maybe coming from top 10 UK customers on a yearly level.
+```{r UK sales by top 10 customers, fig.align = 'center'}
+top_UK_sales_customers <- invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  group_by(CustomerID) %>%
+  summarise(Amount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(rank(desc(Amount)) <= 8) %>%
+  collect
+
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate))),
+         CustomerID = ifelse(CustomerID %in% top_UK_sales_customers$CustomerID, CustomerID, "Other")) %>%
+  group_by(CustomerGroup, SalesMonth, CustomerID) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112) %>%
+  collect %>%
+  ggplot() +
+    geom_line(aes(x = SalesMonth, y = SalesAmount, group = reorder(factor(CustomerID), SalesAmount), color = reorder(factor(CustomerID), SalesAmount)), stat = "identity") +
+    labs(x = "Sales month",
+         y = "Sales amount (GBP)",
+         title = "Total UK wholesale sales by month",
+         color = "Customer ID") +
+    theme(axis.text.x = element_text(angle = 45), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    scale_color_brewer(palette = "Paired")
+```
+
+Customers 17450 and 18102 have had some increased spending in September and October 2011, but those do not explain the sales growth.
+
+
+Let's try identifying top spenders from September - November period (they do not necessarily correspond to overall top spenders).
+```{r UK sales by top 10 customers in September - November period, fig.align = 'center'}
+top_UK_sep_nov_customers <- invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  filter(CustomerGroup == "Wholesale" & Country == "United Kingdom" & SalesMonth >= 201109 & SalesMonth < 201112) %>%
+  group_by(CustomerID) %>%
+  summarise(Amount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(rank(desc(Amount)) <= 8) %>%
+  collect
+
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate))),
+         CustomerID = ifelse(CustomerID %in% top_UK_sep_nov_customers$CustomerID, CustomerID, "Other")) %>%
+  group_by(CustomerGroup, SalesMonth, CustomerID) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112) %>%
+  collect %>%
+  ggplot() +
+    geom_line(aes(x = SalesMonth, y = SalesAmount, group = reorder(factor(CustomerID), SalesAmount), color = reorder(factor(CustomerID), SalesAmount)), stat = "identity") +
+    labs(x = "Sales month",
+         y = "Sales amount (GBP)",
+         title = "Total UK wholesale sales by month",
+         color = "Customer ID") +
+    theme(axis.text.x = element_text(angle = 45), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    scale_color_brewer(palette = "Paired")
+```
+
+So the UK wholesale growth is obviously not coming from top spenders.
+Is it coming due to increased number of customers (new customers)?
+```{r growth from new customers, fig.align = 'center'}
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  group_by(SalesMonth) %>%
+  summarise(NumberDistinctCustomers = n_distinct(CustomerID)) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112) %>%
+  collect %>%
+  ggplot() +
+    geom_line(aes(x = SalesMonth, y = NumberDistinctCustomers, group = "dummy"), colour = "#08306b") +
+    labs(x = "Sales month",
+         y = "Number of distinct customers",
+         title = "Total UK wholesale customers by month") +
+    theme(axis.text.x = element_text(angle = 45), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    coord_cartesian(ylim = c(0, 1600))
+```
+
+So, the sales growth seems to be coming from new customers. Let's divide the customers into new (didn't have purchases before September 2011) and existing customers (had purchases before September 2011). Then we'll be able to see the influence of new customers on sales growth.
+```{r new vs existing customers, fig.align = 'center'}
+customer_tenure_tbl <- invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  filter(!is.na(SalesMonth) & CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  group_by(CustomerID) %>%
+  summarise(FirstPurchase = min(SalesMonth, na.rm = TRUE)) %>%
+  mutate(TenureGroup = ifelse(FirstPurchase < 201109, "Existing", "New"))
+
+invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  filter(!is.na(SalesMonth) & SalesMonth != 201112 & CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  left_join(customer_tenure_tbl, by = "CustomerID") %>%
+  group_by(TenureGroup, SalesMonth) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  collect %>%
+  ggplot() +
+    geom_bar(aes(x = SalesMonth, y = SalesAmount, fill = reorder(factor(TenureGroup), SalesAmount)), stat = "identity") +
+    labs(x = "Sales month",
+         y = "Sales amount (GBP)",
+         title = "Total UK wholesale sales by month",
+         fill = "Customer tenure group") +
+    theme(axis.text.x = element_text(angle = 45), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+    scale_fill_brewer(palette = "Paired")
+```
+
+So, roughly half of the growth comes from new customers, and half from existing.
+Let's make this a more actionable insight - I'll produce a list of top 10 new customer spenders - so that the sales department can prioritize them in the sales process:
+```{r top 10 new customer spenders}
+invoices_tbl %>%
+  mutate(SalesMonth = as.character(as.integer(year(InvoiceDate) * 100 + month(InvoiceDate)))) %>%
+  filter(!is.na(SalesMonth) & CustomerGroup == "Wholesale" & Country == "United Kingdom") %>%
+  left_join(customer_tenure_tbl, by = "CustomerID") %>%
+  filter(TenureGroup == "New") %>%
+  group_by(CustomerID, FirstPurchase) %>%
+  summarise(SalesAmount = sum(InvoiceAmount, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(rank(desc(SalesAmount)) <= 10) %>%
+  arrange(desc(SalesAmount)) %>%
+  collect()
+```
+
+
+How many times in a year do wholesale customers make purchases? How many of them are frequent repeat customers?
+```{r wholesale purchase freq, fig.align = 'center'}
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale") %>%
+  group_by(CustomerID) %>%
+  summarise(NumInvoices = n()) %>%
+  ungroup() %>%
+  group_by(NumInvoices) %>%
+  summarise(NumCustomers = n()) %>%
+  arrange(NumInvoices) %>%
+  collect() %>%
+  ggplot() +
+  geom_freqpoly(aes(x = NumInvoices, y = NumCustomers), stat = "identity", colour = "#08306b") +
+  labs(x = "Number of purchases",
+       y = "Number of customers",
+       title = "Wholesale customers by number of purchases") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+A typical lognormal distribution - a few customers which are very frequent buyers, and a lot of single time buyers.
+It would be easier to see it displayed a bit differently:
+```{r wholesale purchase freq disc, fig.align = 'center'}
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale") %>%
+  group_by(CustomerID) %>%
+  summarise(NumInvoices = as.double(n())) %>%
+  ungroup() %>%
+  ft_bucketizer(input_col = "NumInvoices", output_col = "NumInvoicesDisc", splits = c(1,2,3,4,5,6,11,16,21,Inf)) %>%
+  group_by(NumInvoicesDisc) %>%
+  summarise(NumCustomers = n()) %>%
+  arrange(NumInvoicesDisc) %>%
+  collect() %>%
+  mutate(NumInvoicesDisc = ordered(NumInvoicesDisc,
+                                   levels = c(0,1,2,3,4,5,6,7,8),
+                                   labels = c("1","2","3","4","5","6-10","11-15","16-20","21+")),
+         Group = "Purchases") %>%
+  ggplot() +
+  geom_bar(aes(x = Group, fill = reorder(NumInvoicesDisc, desc(NumInvoicesDisc)), y = NumCustomers), stat = "identity", position = "stack") +
+  labs(x = "",
+       y = "Number of customers",
+       title = "Wholesale customers by number of purchases",
+       fill = "Number of purchases") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Blues")
+```
+
+30% of the wholesale customers are one-time buyers (only one purchase in a year). Another 20% are two-time buyers, and another 10% had 3 purchases in a year. This would be a good time to discuss with the client businesspeople the concept of regular customers. How many purchases in a year make a regular customer?
+Since the store is offering all-occasion gifts, and they tend to change with the seasons (causing upsurges in sales), I'll assume regular customers should have at least 4 purchases in a year - one for each season. Let's see the top 10 spending regular customers - those should be handled with special attention.
+
+```{r top 10 regular customers}
+invoices_tbl %>%
+  filter(CustomerGroup == "Wholesale") %>%
+  group_by(CustomerID) %>%
+  summarise(NumInvoices = n(),
+            AmountSpent = sum(InvoiceAmount, na.rm = TRUE),
+            FirstPurchase = min(InvoiceDate, na.rm = TRUE),
+            AvgPurchaseValue = sum(InvoiceAmount, na.rm = TRUE) / n()) %>%
+  ungroup() %>%
+  filter(NumInvoices >= 4 & rank(desc(AmountSpent)) <= 10)
+```
+
+
+To wrap up this part of analysis, I'll create and store a wholesale customers table with some descriptive features.
+It will come in handy later - i.e. for customer behaviour segmentation. I'll add the following customer features:
+
+Column                      | Description
+----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------
+Country                     | Customer country of origin
+NumPurchases                | Total number of purchases
+FirstPurchase               | Date of the first purchase
+LastPurchase                | Date of the last purchase
+AmountSpent                 | Total amount spent (over all purchases)
+AvgPurchaseValue            | Average value of the purchase
+StddevPurchaseValue         | Standard deviation of purchase values (measure of spread of individual purchase values)
+MinPurchaseValue            | Smallest purchase amount
+MaxPurchaseValue            | Largest purchase amount
+AvgDaysBetweenPurchases     | Average days between purchases
+StddevDaysBetweenPurchases  | Standard deviation of days between purchases (measure of spread)
+MinDaysBetweenPurchases     | Shortest time between purchases (in days)
+MaxDaysBetweenPurchases     | Longest time between purchases (in days)
+DaysSinceLastPurchase       | Number of days since last purchase (compared to first date after end of data - 10/12/2011)
+TenureDays                  | How long has this customer been a customer (compared to first date after end of data - 10/12/2011)
+SeasonalNumPurchases        | How many purchases has a customer done in seasonal months (March, May, September, November, December)?
+SeasonalAmountSpent         | Total amount spent on purchases in seasonal months (March, May, September, November, December)?
+TenureGroup                 | Is the customer new (first purchase in the last 90 days), or existing (first purchase before the last 90 days)?
+
+```{r create wholesale customers table}
+if(!file.exists("Data/spark-warehouse/wholesale_customers")){
+  wholesale_customers_tbl <- invoices_tbl %>%
+    filter(CustomerGroup == "Wholesale") %>%
+    select(CustomerID, Country, InvoiceNo, InvoiceDate, InvoiceAmount) %>%
+    arrange(CustomerID, InvoiceDate) %>%
+    group_by(CustomerID) %>%
+    mutate(PreviousPurchase = lag(InvoiceDate, 1),
+           DaysSincePrevPurchase = ifelse(!is.na(lag(InvoiceDate, 1)), datediff(date(InvoiceDate), date(lag(InvoiceDate, 1))), NA)) %>%
+    summarise(Country = max(Country, na.rm = TRUE),
+              NumPurchases = n(),
+              FirstPurchase = min(InvoiceDate, na.rm = TRUE),
+              LastPurchase = max(InvoiceDate, na.rm = TRUE),
+              AmountSpent = sum(InvoiceAmount, na.rm = TRUE),
+              AvgPurchaseValue = mean(InvoiceAmount, na.rm = TRUE),
+              StddevPurchaseValue = sd(InvoiceAmount),
+              MinPurchaseValue = min(InvoiceAmount, na.rm = TRUE),
+              MaxPurchaseValue = min(InvoiceAmount, na.rm = TRUE),
+              AvgDaysBetweenPurchases = mean(DaysSincePrevPurchase, na.rm = TRUE),
+              StddevDaysBetweenPurchases = sd(DaysSincePrevPurchase),
+              MinDaysBetweenPurchases = min(DaysSincePrevPurchase, na.rm = TRUE),
+              MaxDaysBetweenPurchases = max(DaysSincePrevPurchase, na.rm = TRUE),
+              DaysSinceLastPurchase = datediff(to_date("2011-12-10 00:00:00"), date(max(InvoiceDate, na.rm = TRUE))),
+              TenureDays = datediff(to_date("2011-12-10 00:00:00"), date(min(InvoiceDate, na.rm = TRUE))),
+              SeasonalNumPurchases = sum(ifelse(month(InvoiceDate) %in% c(3,5,9,11,12), 1, 0), na.rm = TRUE),
+              SeasonalAmountSpent = sum(ifelse(month(InvoiceDate) %in% c(3,5,9,11,12), InvoiceAmount, 0), na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(TenureGroup = ifelse(TenureDays > 90, "Existing", "New"))
+      
+    # register the temp table in Spark        
+    sdf_register(wholesale_customers_tbl, "wholesale_customers")
+  
+    # save the Spark DataFrame to a Parquet file(s) for persistence across sessions (Spark applications) - to a local filesystem, current project Data/spark-warehouse subdirectory
+    spark_write_parquet(wholesale_customers_tbl,str_c("file:", getwd(), "/Data/spark-warehouse/wholesale_customers"), mode = "overwrite")
+}
+```
+
+
+Just a quick check if the customer records are unique:
+```{r customer uniqueness check}
+wholesale_customers_tbl <- spark_read_parquet(sc, "wholesale_customers", str_c("file:", getwd(), "/Data/spark-warehouse/wholesale_customers"), mode = "overwrite")
+# check if the customer records are unique
+wholesale_customers_tbl %>%
+  summarise(n_rows = n(),
+            n_distinct_customers = n_distinct(CustomerID))
+```
+
+### Product level analysis
+
+I'll take only regular invoices, as in the invoices analysis.
+```{r only regular invoices}
+sales_transactions_tbl <- sales_transactions_tbl %>%
+  filter(is.na(InvoicePrefix) & is.na(InvoiceStatus))
+```
+
+
+How many different products are there? From initial data quality I know that some StockCodes have multiple descriptions, so I'll count over StockCode to avoid duplicates.
+```{r distinct products}
+sales_transactions_tbl %>%
+  summarise(n_dist_products = n_distinct(StockCode))
+```
+
+Let's now look at those cases with multiple descriptions. I'll measure the frequency of each multiple case, to see if I can clean it by taking the most frequent descripton for each StockCode.
+```{r multiple descriptions}
+multiple_descriptions <- sales_transactions_tbl %>%
+  group_by(StockCode) %>%
+  summarise(n_desc = n_distinct(Description)) %>%
+  filter(n_desc > 1)
+
+sales_transactions_tbl %>%
+  inner_join(multiple_descriptions, by = "StockCode") %>%
+  select(n_desc, StockCode, Description) %>%
+  group_by(n_desc, StockCode, Description) %>%
+  summarise(n_rows = n()) %>%
+  arrange(desc(n_desc), StockCode, desc(n_rows)) %>%
+  head(100)
+```
+
+Yes, I can definitely clean up the descriptions by taking the most frequent description for every StockCode. I'll save the clean product info to a separate table in Spark.
+```{r clean product table}
+products_tbl <- sales_transactions_tbl %>%
+  group_by(StockCode, Description) %>%
+  summarise(n_rows = n()) %>%
+  filter(rank(desc(n_rows)) == 1) %>%
+  select(StockCode, Description)
+
+    # register the temp table in Spark        
+    sdf_register(products_tbl, "products")
+  
+    # save the Spark DataFrame to a Parquet file(s) for persistence across sessions (Spark applications) - to a local filesystem, current project Data/spark-warehouse subdirectory
+    spark_write_parquet(products_tbl, str_c("file:", getwd(), "/Data/spark-warehouse/products"), mode = "overwrite")
+```
+
+I'll join the clean product names back to transactions to get consistent product descriptions. 
+```{r join the cleaned products back into transactions}
+sales_transactions_tbl <- sales_transactions_tbl %>%
+  select(-Description) %>%
+  inner_join(products_tbl, by = "StockCode")
+```
+
+
+How are variations of the same products handled (i.e. same product, different colour)? Let's look at clean product StockCodes and descriptions, ordered by Stockcode.
+```{r products ordered by StockCode}
+products_tbl %>%
+  arrange(StockCode) %>%
+  head(100)
+```
+
+It seems product variations are handled by product suffixes.
+```{r product suffixes example}
+products_tbl %>%
+  filter(substr(StockCode, 1, 5) %in% c("15056", "16161")) %>%
+  arrange(StockCode)
+```
+
+However, variation naming is not consistent. It would be difficult to extract core product names from variation names. 
+
+In addition, not all variations are handled by product suffixes:
+```{r product suffixes counterexample}
+products_tbl %>%
+  filter(StockCode %in% c("16014", "16015", "16016"))
+```
+
+In a real world project, this would be an excellent time to talk to client businesspeople. There most certainly are product groups/taxonomies in the system where this data came from, which would save a lot of work. How many of the total products are actually variations? If there aren't many, I'll simply treat them as regular products and go on.
+```{r variations vs regular products counts}
+products_tbl %>%
+  mutate(ProductType = ifelse(substr(StockCode, -1, 1) %in% letters | substr(StockCode, -1, 1) %in% LETTERS, "Variation", "Regular")) %>%
+  group_by(ProductType) %>%
+  summarise(n_rows = n()) %>%
+  collect %>%
+  ggplot() +
+  geom_bar(aes(x = ProductType, y = n_rows), stat = "identity", position = "dodge", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Product type", y = "Number of products")
+```
+
+So, roughly a quarter of all products are variations. Is the relationship the same if I look at sales amounts, instead of product counts?
+```{r variations vs regular products sales amounts}
+sales_transactions_tbl %>%
+  mutate(ProductType = ifelse(substr(StockCode, -1, 1) %in% letters | substr(StockCode, -1, 1) %in% LETTERS, "Variation", "Regular")) %>%
+  group_by(ProductType) %>%
+  summarise(SalesAmount = sum(Quantity * UnitPrice, na.rm = TRUE)) %>%
+  collect %>%
+  ggplot() +
+  geom_bar(aes(x = ProductType, y = SalesAmount), stat = "identity", position = "dodge", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Product type", y = "Sales amount (GBP)")
+```
+
+Variations take up only 1/7 of the revenue. I can then treat variations as regular products and go on.
+
+What are the top products sold by revenue?
+```{r Top products by revenue}
+sales_transactions_tbl %>%
+  group_by(StockCode, Description) %>%
+  summarise(SalesAmount = sum(Quantity * UnitPrice, na.rm = TRUE)) %>%
+  filter(rank(desc(SalesAmount)) <= 100) %>%
+  arrange(desc(SalesAmount)) %>%
+  head(100)
+```
+
+A-ha! Some of the top products aren't really products at all. Postage is not real revenue - it is forwarded to the shipping service. There is also a suspicious "Manual" line item, and "Amazon fee" - in a real world project I would ask the client businesspeople about it. In this case, I'll simply exclude the items.
+```{r excluding postage "Manual" and "Amazon fee" products, message=FALSE}
+sales_transactions_tbl <- sales_transactions_tbl %>%
+  filter(!StockCode %in% c("DOT", "POST", "M", "AMAZONFEE"))
+
+# I'm looking at average price, because the price of a product can change during the year.
+sales_transactions_tbl %>%
+  group_by(StockCode, Description) %>%
+  summarise(SalesAmount = sum(Quantity * UnitPrice, na.rm = TRUE),
+            SalesQuantity = sum(Quantity, na.rm = TRUE),
+            AvgPrice = mean(UnitPrice, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(SalesAmtPercOfTotal = round(SalesAmount / sum(SalesAmount, na.rm = TRUE) * 100, 2)) %>%
+  arrange(desc(SalesAmount)) %>%
+  mutate(CumRevenue = cumsum(SalesAmount),
+         CumRevPerc = cumsum(SalesAmtPercOfTotal)) %>%
+  filter(rank(desc(SalesAmount)) <= 100)
+```
+
+So the cakestand is by far the top sold product, making 1.7% of total revenue - and with a high unit price. Since the UK is the dominant market, that makes sense - can't have a proper tea-time without cakes on a cakestand :)
+Other top products are mostly low priced, but with high volumes.
+Top ten sold products amount to 8% of total revenue, 812.000 GBP.  Let's look at top 10 products by customer group - if they are different.
+
+```{r top 10 products}
+top_10_products <- sales_transactions_tbl %>%
+  mutate(CustomerGroup = ifelse(is.na(CustomerID), "Retail", "Wholesale")) %>%
+  group_by(Description, CustomerGroup) %>%
+  summarise(SalesAmount = sum(Quantity * UnitPrice, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(CustomerGroup) %>%
+  filter(rank(desc(SalesAmount)) <= 10) %>%
+  collect
+
+top_10_products %>%
+  filter(CustomerGroup == "Wholesale") %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(factor(Description), SalesAmount), y = SalesAmount), stat = "identity", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Product", 
+       y = "Sales amount (GBP)",
+       title = "Top 10 sold products - wholesale") +
+  coord_flip()
+
+top_10_products %>%
+  filter(CustomerGroup == "Retail") %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(factor(Description), SalesAmount), y = SalesAmount), stat = "identity", fill = "#08306b") +
+  scale_y_continuous(labels = scales::format_format(big.mark = ".", decimal.mark = ",", scientific = FALSE)) +
+  labs(x = "Product", 
+       y = "Sales amount (GBP)",
+       title = "Top 10 sold products - retail") +
+  coord_flip()
+```
+
+There are a couple of products that are common for top 10 sold products in retail and wholesale: "Regency cakestand 3 tier", "Party bunting", "Rabbit night light", "Paper chain 50's Christmas".
+To continue the products versus revenue analysis, a hierarchy of products would be needed (normally it would be provided by the client).
+
+### Which products are frequently bought together? The market basket analysis (frequent itemsets)
+
+I'll use the Spark's MLlib machine learning library, which contains a parallelised implementation of the [frequent itemsets algorithm, FPgrowth](https://spark.apache.org/docs/2.3.1/ml-frequent-pattern-mining.html).
+I have to prepare the data first - fpgrowth expects one row per purchase, and all products in that purchase collapsed in a list.
+```{r data preparation for fpgrowth}
+itemsets_tbl <- sales_transactions_tbl %>%
+  select(InvoiceNo, Description) %>%
+  distinct() %>%
+  group_by(InvoiceNo) %>%
+  summarise(items = collect_list(Description))
+
+# let's look at how the prepared data looks like - one row, one invoice, and a list of its line items
+head(itemsets_tbl)
+```
+
+Let's now run the FPgrowth. I've already tuned the hyperparameters to a sensible values for this case.
+```{r FPgrowth first run}
+# run the FPGrowth
+fp_model <- ml_fpgrowth(itemsets_tbl, min_confidence = 0.5, min_support = 0.025)
+
+# extract the derived frequent itemsets and reformat the data
+freq_itemsets <- ml_freq_itemsets(fp_model) %>%
+  collect %>%
+  mutate(list_length = map_int(items, length)) %>%
+  filter(list_length > 1) %>%
+  arrange(desc(freq)) %>%
+  mutate(itemset = map_chr(items, str_c, sep = "-", collapse = "-")) %>%
+  select(-items, -list_length)
+
+# display the itemsets
+freq_itemsets
+```
+
+Here they are - pairs of items frequently purchased together. Column "freq" indicates in how many purchases does the product pair appear. It would be easier to see the itemsets arranged relative to frequency of appearance - here is one way to do it - a wordcloud:
+```{r frequent itemsets wordcloud, message=FALSE, warning=FALSE}
+library(wordcloud)
+
+wordcloud(freq_itemsets$itemset, freq_itemsets$freq, max.words = 20, scale=c(0.1, 3.0),rot.per = 0,
+               colors=brewer.pal(8, "Dark2"), random.order = FALSE, random.color = FALSE, fixed.asp = FALSE)
+```
+
+Text color and size are proportional to pair frequency.
+
+Notice that some products appear in more than one pair! That means it would be much more revealing to display the data in network form. It would also be helpful to see association directions between pair members - indicating the purchase of which product leads to purchase of another.
+Luckily, the FPgrowth algorithm provides us with just that - association rules! Let's extract them and display them in network form.
+I'll be using the D3 based network visualization.
+```{r association rules network, message=FALSE}
+library(networkD3)
+
+# extract association rules
+assoc_rules <- ml_association_rules(fp_model) %>%
+  collect %>%
+  mutate(antecedent = map_chr(antecedent, str_c, sep = " + ", collapse = " + ")) %>%
+  mutate(consequent = map_chr(consequent, str_c, sep = " + ", collapse = " + "))
+
+# create a list of distinct antecedents
+ante <- assoc_rules %>%
+      distinct(antecedent) %>%
+      transmute(name = antecedent)
+
+# create a list of distinct consequents, combine them with distinct antecedents to create a list of network nodes
+# add a unique id to every node
+nodes <- assoc_rules %>%
+  distinct(consequent) %>%
+  transmute(name = consequent) %>%
+  bind_rows(ante) %>%
+  distinct() %>%
+  mutate(group = "1") %>%
+  mutate(row_id = seq(from = 0, length.out = length(name)), size = 20)
+
+# extract directed link information from association rules, and add corresponding node IDs
+links <- assoc_rules %>%
+  left_join(nodes, by = c("antecedent" = "name")) %>%
+  mutate(antecedent_row_id = row_id) %>%
+  select(-row_id) %>%
+  left_join(nodes, by = c("consequent" = "name")) %>%
+  mutate(consequent_row_id = row_id) %>%
+  select(-row_id,-group.x,-group.y)
+
+# create the network visual using the nodes and links
+forceNetwork(Links = as.data.frame(links), Nodes = as.data.frame(nodes), Source = "antecedent_row_id",
+             Target = "consequent_row_id", Value = "confidence", NodeID = "name",
+             Group = "group", opacity = 0.9, arrows = TRUE, linkWidth = JS("function(d) { return d.value * 4; }"),
+             Nodesize = "size", fontSize = 15, fontFamily = "arial", linkDistance = 100, charge = -30, bounded = TRUE,
+             opacityNoHover = 0.5)
+```
+
+I can now clearly see that **items which are frequently bought together appear in clusters of variations of the same product**. This behavior is a signature of wholesale customers - when they order a product, they frequently order multiple variations of that product, to add variety to their gift shop offering.
+
+It would be even more interesting to see how the itemsets change with seasons - since I already know from exploratory analysis that gifts are a seasonal business. That would be interesting for the client businesspeople too, so I'll create a data driven interactive web application using the Shiny framework. You can see it here: [demo web app](https://renee-ahel.shinyapps.io/OnlineRetailDemo/).
+
+### What would a wholesale customer buy next? The recommender engine
+
+In the previous step I've detected products frequently purchased together over the whole customer base. To make an operational impact, I need to make next best product recomendations on individual customer level. I'll use the Spark's MLlib machine learning library, which contains an [ALS (alternating least squares)](https://spark.apache.org/docs/2.3.1/ml-collaborative-filtering.html) recommender engine. I'm focusing on wholesale customers, because I can identify them, unlike retail customers.
+
+I have to prepare the data first. A recommender engine expects rating information for each customer-product pair - however, I only have the purchase information. Since this is often the case, it is possible to supply alternate information, such as purchase quantity - it is used as a measure of the strength of the relationship.
+I also have to generate a replacement ID for StockCode, as Spark ALS implementation currently accepts only integer values for product IDs, and some StockCodes contain letters. I also need to aggregate all purchases of the same product by the same customer, to enable ALS to construct a customer-product relationship matrix.
+```{r data preparation for ALS}
+ratings_tbl <- sales_transactions_tbl %>%
+  filter(!is.na(CustomerID)) %>%
+  select(CustomerID, StockCode, Description, Quantity) %>%
+  group_by(CustomerID, StockCode, Description) %>%
+  summarise(Quantity = sum(Quantity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(CustomerID = as.integer(CustomerID),
+         StockID = as.integer(rank(StockCode)))
+
+# let's look at how the prepared data looks like - one row, one item, and a quantity transformed into 1-10 rating
+head(ratings_tbl, 250)
+
+# How many ratings do I have?
+ratings_tbl %>%
+  summarise(row_count = n())
+
+# create a stock ID and names table - to join it back to results
+product_names_tbl <- ratings_tbl %>%
+  select(StockID, StockCode, Description) %>%
+  distinct()
+```
+
+
+There is a fair amount of ratings data - 266.325 rows. As I don't have straight ratings to supply, I can't test the model as a regressor, so I'll supply the whole dataset for training.
+```{r ALS training}
+# train the ALS. I'll set the regularization parameter to 0.1, set implicit preference to true to indicate to ALS that ratings are actually derived from other information, and set the cold start to drop, to get only the results where the recommender returns a recommendation.
+als_model <- ml_als(ratings_tbl, rating_col = "Quantity", user_col = "CustomerID",
+  item_col = "StockID", reg_param = 0.1,
+  implicit_prefs = TRUE, alpha = 1, nonnegative = FALSE,
+  max_iter = 10, num_user_blocks = 10, num_item_blocks = 10,
+  checkpoint_interval = 10, cold_start_strategy = "drop")
+```
+
+Let's view the top 5 product recommendations for each customer.
+```{r ALS validation}
+top_5_recommended_products <- ml_recommend(als_model, type = "items", 5) %>%
+  inner_join(product_names_tbl, by = "StockID") %>%
+  select(-recommendations) %>%
+  arrange(CustomerID, desc(rating))
+
+top_5_recommended_products %>%
+  head(100)
+```
+
+Let's now compare for a couple of customers their purchase history and the recommendations.
+
+
+Customer 12353 purchase history:
+```{r customer 12353 purchase history}
+ratings_tbl %>%
+  filter(CustomerID == 12353) %>%
+  arrange(CustomerID, desc(Quantity)) %>%
+  select(CustomerID, StockCode, Description, Quantity)
+```
+Customer 12353 recommendations:
+```{r customer 12353 recommendations}
+top_5_recommended_products %>%
+  filter(CustomerID == 12353) %>%
+  arrange(CustomerID, desc(rating)) %>%
+  select(CustomerID, StockCode, Description, rating)
+```
+
+Customer 12361 purchase history:
+```{r customer 12361 purchase history}
+ratings_tbl %>%
+  filter(CustomerID == 12361) %>%
+  arrange(CustomerID, desc(Quantity)) %>%
+  select(CustomerID, StockCode, Description, Quantity)
+```
+Customer 12361 recommendations:
+```{r customer 12361 recommendations}
+top_5_recommended_products %>%
+  filter(CustomerID == 12361) %>%
+  arrange(CustomerID, desc(rating)) %>%
+  select(CustomerID, StockCode, Description, rating)
+```
+
+Customer 12367 purchase history:
+```{r customer 12367 purchase history}
+ratings_tbl %>%
+  filter(CustomerID == 12367) %>%
+  arrange(CustomerID, desc(Quantity)) %>%
+  select(CustomerID, StockCode, Description, Quantity)
+```
+Customer 12367 recommendations:
+```{r customer 12367 recommendations}
+top_5_recommended_products %>%
+  filter(CustomerID == 12367) %>%
+  arrange(CustomerID, desc(rating)) %>%
+  select(CustomerID, StockCode, Description, rating)
+```
+
+Customer 12401 purchase history:
+```{r customer 12401 purchase history}
+ratings_tbl %>%
+  filter(CustomerID == 12401) %>%
+  arrange(CustomerID, desc(Quantity)) %>%
+  select(CustomerID, StockCode, Description, Quantity)
+```
+Customer 12401 recommendations:
+```{r customer 12401 recommendations}
+top_5_recommended_products %>%
+  filter(CustomerID == 12401) %>%
+  arrange(CustomerID, desc(rating)) %>%
+  select(CustomerID, StockCode, Description, rating)
+```
+
+Customer 12441 purchase history:
+```{r customer 12441 purchase history}
+ratings_tbl %>%
+  filter(CustomerID == 12441) %>%
+  arrange(CustomerID, desc(Quantity)) %>%
+  select(CustomerID, StockCode, Description, Quantity)
+```
+Customer 12441 recommendations:
+```{r customer 12441 recommendations}
+top_5_recommended_products %>%
+  filter(CustomerID == 12441) %>%
+  arrange(CustomerID, desc(rating)) %>%
+  select(CustomerID, StockCode, Description, rating)
+```
+
+From the examples I can see that the recommender is making sensible recommendations. In a real world project, the next step would be to make the recommender operational - by exposing an API for the webshop application to use, or to deliver data via batch jobs to an interface database table, or any other way of integration suitable for the webshop system.
+In this case I'll demonstrate how the recommender performs by displaying its output in a webapp I've already created to display other useful information for the buisnesspeople. You can see it here: [demo web app](https://renee-ahel.shinyapps.io/OnlineRetailDemo/).
+
+Finished! Disconnect from Spark.
+```{r disconnect_spark}
+spark_disconnect(sc)
+```
+
+
