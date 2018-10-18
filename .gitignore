@@ -6,4 +6,4 @@ Data/
 rsconnect/
 WebApp/rsconnect/
 logs/
-retail_data_analysis.html
+*.html
